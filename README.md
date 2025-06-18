@@ -9,7 +9,6 @@ MacBook Air M1上のArduino IDE 2.3.6でのビルド・アップロードを想�
 
     orca-m5stick-cplus-device/
     ├ README.md
-    ├ LICENSE
     ├ .gitignore
     └ orca-m5stick-cplus-device.ino
 
