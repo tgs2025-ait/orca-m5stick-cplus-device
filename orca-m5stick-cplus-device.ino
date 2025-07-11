@@ -1,5 +1,7 @@
 #include <M5StickCPlus.h>
+#include "BluetoothSerial.h"
 
+BluetoothSerial SerialBT;
 float AX, AY, AZ;
 
 void setup() {
@@ -11,6 +13,10 @@ void setup() {
   M5.Lcd.setTextSize(3);
 
   Serial.begin(115200); // ハードウェアシリアルを初期化
+  SerialBT.begin(115200);//Bluetooth経由でのシリアル通信のボーレードを指定
+  SerialBT.begin("orca-m5stick-c-plus-device");//Bluetoothデバイス名
+
+
   delay(100);           // 安定化待ち
 }
 
@@ -27,8 +33,13 @@ void loop() {
   // シリアルプロッタ用出力
   // フォーマット：AX:値 AY:値 AZ:値
   Serial.print("AX:"); Serial.print(AX);
+  SerialBT.print("AX:"); SerialBT.print(AX);
+
   Serial.print(" AY:"); Serial.print(AY);
+  SerialBT.print(" AY:"); SerialBT.print(AY);
+
   Serial.print(" AZ:"); Serial.println(AZ);
+  SerialBT.print(" AZ:"); SerialBT.println(AZ);
 
   delay(200);  // 出力間隔 200ms（約5Hz）
 }
