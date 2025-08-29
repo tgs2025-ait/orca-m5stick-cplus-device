@@ -1,12 +1,13 @@
 /*
  * M5StickC Plus（初代, MPU6886=6軸） + M5Unified + MadgwickAHRS
- * 精度優先キャリブレーション版 + シリアルプロッタ固定レンジ出力
- *  - ジャイロ/加速度とも 1500 サンプル平均（約6〜7秒）
- *  - 進捗表示（プログレスバー）
- *  - 姿勢推定・区間5移動平均・BtnAで再キャリブ・BT出力は従来通り
- *  - NEW: Arduino IDE シリアルプロッタ向けに
- *          1行目：凡例を送信
- *          毎フレーム：ax..yaw に加え固定線 Min/Max を一緒に送出（Yレンジを実質固定）
+ * - キャリブレーションは BtnA（Aボタン）押下時のみ実行（起動時は実行しない）
+ * - 未キャリブ状態でもバッテリー残量を表示し、「Press A and Calibrate」を促す
+ * - USB給電状態（ON/OFF と V/I）を表示
+ * - ジャイロ/加速度とも デフォルト1500 サンプル平均（約6〜7秒）
+ * - 進捗表示（プログレスバー）
+ * - 姿勢推定・区間5移動平均
+ * - BT出力（ay/pitch/roll）
+ * - USBシリアルプロッタ（ay/pitch/roll + Min/Max）
  */
 
 #include <M5Unified.h>
@@ -40,7 +41,7 @@ static uint32_t next_ms = 0;          // 100msごと
 static uint32_t next_display_ms = 0;  // LCD更新タイマー（本番時 60sごと）
 
 // --- モード切替 ---
-bool debugMode = true;  // ← 本番: false / デバッグ: true
+bool debugMode = false;  // ← 本番: false / デバッグ: true
 
 // --- 精度優先キャリブ用サンプル数（必要なら変更） ---
 static const uint16_t CALIB_G_SAMPLES = 1500;
@@ -51,6 +52,12 @@ const bool   ENABLE_SERIAL_PLOTTER = true;   // 必要なければ false
 const float  PLOT_YMIN = -180.0f;            // 例：姿勢角の下限
 const float  PLOT_YMAX =  180.0f;            // 例：姿勢角の上限
 bool         plotterHeaderSent = false;      // 凡例行を一度だけ送るため
+
+// --- 起動後のキャリブ実施フラグ ---
+bool calibratedOnce = false;
+
+// --- USB検出用しきい値 ---
+static const float VBUS_ON_THRESHOLD_V = 4.5f;
 
 // プロトタイプ
 void initM5();
@@ -77,12 +84,11 @@ void setup() {
   // Madgwick を 10Hz 前提で初期化（loopは100ms周期）
   filter.begin(10);
 
-  // 起動時キャリブレーション（水平・静止を想定）
-  doOnDemandCalibration(CALIB_G_SAMPLES, CALIB_A_SAMPLES);
+  // ★起動時キャリブレーションは実行しない★
 
   next_ms = millis() + 100;
 
-  // 初回更新
+  // 初回更新（現オフセット=0で一度回して初期姿勢をセット）
   int batPct = M5.Power.getBatteryLevel();
   M5.Imu.getAccel(&accX, &accY, &accZ);
   M5.Imu.getGyro(&gyroX, &gyroY, &gyroZ);
@@ -107,7 +113,7 @@ void setup() {
 
   // シリアルプロッタ：凡例行
   if (ENABLE_SERIAL_PLOTTER && !plotterHeaderSent) {
-    Serial.println("ax,ay,az,roll,pitch,yaw,Min,Max");
+    Serial.println("ay,pitch,roll,Min,Max");
     plotterHeaderSent = true;
   }
 
@@ -117,10 +123,9 @@ void setup() {
 void loop() {
   M5.update();
 
-  // BtnA（正面）で再キャリブレーション
+  // BtnA（正面）でキャリブレーション（★ボタン押下時のみ実行★）
   if (M5.BtnA.wasPressed()) {
     doOnDemandCalibration(CALIB_G_SAMPLES, CALIB_A_SAMPLES);
-    // 再キャリブ後もプロッタ凡例は維持する（再送しない）
   }
 
   // 1) IMU 読み出し
@@ -159,7 +164,7 @@ void loop() {
     next_display_ms = now + (debugMode ? 100 : 60000);
   }
 
-  // 7) Bluetooth出力（加速度 + 姿勢角（平滑後））
+  // 7) Bluetooth出力（ay + 姿勢角（平滑後））
   outputBT(ax, ay, az, roll_deg, pitch_deg, yaw_deg);
 
   // 8) シリアルプロッタ出力（固定線Min/Max付き）
@@ -182,7 +187,7 @@ void initM5() {
   M5.begin(cfg);
 
   setCpuFrequencyMhz(80);
-  M5.Display.setBrightness(64);// MAX: 255
+  M5.Display.setBrightness(64); // MAX: 255
   M5.Display.setRotation(3);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextSize(2);
@@ -250,7 +255,7 @@ void calibrateAccelOffset(uint16_t samples) {
   aOffZ = azm - EX_AZ;
 }
 
-// ---- On-demand キャリブレーション（BtnA押下時/起動時に呼ぶ）----
+// ---- On-demand キャリブレーション（BtnA押下時に呼ぶ）----
 void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples) {
   // 案内
   drawProgress("Prepare: lay flat & still", 0, 100);
@@ -291,6 +296,9 @@ void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples) {
 
   SerialBT.printf("CALIB_DONE, aOff=(%.4f,%.4f,%.4f), gOff=(%.4f,%.4f,%.4f)\n",
                   aOffX, aOffY, aOffZ, gOffX, gOffY, gOffZ);
+
+  // ★ キャリブ済みフラグを立てる
+  calibratedOnce = true;
 }
 
 // ---- 移動平均の初期化 ----
@@ -304,46 +312,57 @@ void resetAverages() {
 // ---- 表示 ----
 void renderUI(int batteryPct, float ax, float ay, float az,
               float roll_d, float pitch_d, float yaw_d, bool showDebug) {
+  // 取得：USB VBUSの電圧/電流（M5Unified: AXP192）
+  float vbus = M5.Power.Axp192.getVBUSVoltage(); // [V]
+  float ibus = M5.Power.Axp192.getVBUSCurrent(); // [mA]
+  bool usb_on = (vbus > VBUS_ON_THRESHOLD_V);
+
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setCursor(0, 0);
   M5.Display.printf("Bat:%3d%%\n", batteryPct);
 
+  // 2行目にUSB状態
+  M5.Display.setCursor(0, 18);
+  if (usb_on) {
+    M5.Display.printf("USB: ON (%.2fV %.0fmA)\n", vbus, ibus);
+  } else {
+    M5.Display.print("USB: OFF\n");
+  }
+
+  if (!calibratedOnce) {
+    // 未キャリブ時：バッテリー＆USBだけ表示し、案内を追加
+    M5.Display.setCursor(0, 36);
+    M5.Display.println("Press A and Calibrate");
+    return;  // 以降の詳細表示はスキップ
+  }
+
   if (showDebug) {
-    M5.Display.setCursor(0, 28);
+    M5.Display.setCursor(0, 36);
     M5.Display.printf("aX:%6.2f aY:%6.2f aZ:%6.2f\n", ax, ay, az);
-    M5.Display.setCursor(0, 58);
+    M5.Display.setCursor(0, 66);
     M5.Display.printf("Roll :%7.2f\n", roll_d);
     M5.Display.printf("Pitch:%7.2f\n", pitch_d);
     M5.Display.printf("Yaw  :%7.2f\n", yaw_d);
-    M5.Display.setCursor(0, 120);
+    M5.Display.setCursor(0, 128);
     M5.Display.print("BtnA: Calibrate");
   } else {
-    M5.Display.setCursor(0, 28);
+    M5.Display.setCursor(0, 36);
     M5.Display.print("BtnA: Calibrate");
   }
 }
 
-// ---- BT出力 ----
+// ---- BT出力（ay, pitch, roll ラベル付き）----
 void outputBT(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d) {
-  if (debugMode) {
-    SerialBT.printf("%.3f %.3f %.3f %.3f %.3f %.3f\n",
-                    ax, ay, az, roll_d, pitch_d, yaw_d);
-  } else {
-    SerialBT.printf("ax:%.3f, ay:%.3f, az:%.3f, roll:%.3f, pitch:%.3f, yaw:%.3f\n",
-                    ax, ay, az, roll_d, pitch_d, yaw_d);
-  }
+  SerialBT.printf("ay:%.3f, pitch:%.3f, roll:%.3f\n", ay, pitch_d, roll_d);
 }
 
-// ---- シリアルプロッタ（固定線 Min/Max を含めて出力）----
+// ---- シリアルプロッタ（ay, pitch, roll のみ + 固定線）----
 void outputSerialPlotter(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d) {
   // ラベル行はsetupで送信済み
-  Serial.print(ax, 3);     Serial.print(',');
-  Serial.print(ay, 3);     Serial.print(',');
-  Serial.print(az, 3);     Serial.print(',');
-  Serial.print(roll_d, 3); Serial.print(',');
-  Serial.print(pitch_d, 3);Serial.print(',');
-  Serial.print(yaw_d, 3);  Serial.print(',');
-  Serial.print(PLOT_YMIN, 3); Serial.print(',');
+  Serial.print(ay, 3);       Serial.print(',');
+  Serial.print(pitch_d, 3);  Serial.print(',');
+  Serial.print(roll_d, 3);   Serial.print(',');
+  Serial.print(PLOT_YMIN, 3);Serial.print(',');
   Serial.println(PLOT_YMAX, 3);
 }
 
