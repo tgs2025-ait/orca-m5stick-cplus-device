@@ -1,68 +1,173 @@
 /*
- * M5StickC Plus（初代, MPU6886=6軸） + M5Unified 版
- * 目的：
- *  - デバッグ時 (debugMode = true):
- *      LCD → バッテリー + 加速度を100msごとに更新
- *      BT  → シリアルプロッタ形式（空白区切り数値）
- *  - 本番時 (debugMode = false):
- *      LCD → バッテリーのみ表示。画面は出しっぱなしで 60秒ごとにだけ更新
- *      BT  → "ax:..., ay:..., az:..." ラベル付き形式を100msごとに送信
+ * M5StickC Plus（初代, MPU6886=6軸） + M5Unified + MadgwickAHRS
+ * 精度優先キャリブレーション版 + シリアルプロッタ固定レンジ出力
+ *  - ジャイロ/加速度とも 1500 サンプル平均（約6〜7秒）
+ *  - 進捗表示（プログレスバー）
+ *  - 姿勢推定・区間5移動平均・BtnAで再キャリブ・BT出力は従来通り
+ *  - NEW: Arduino IDE シリアルプロッタ向けに
+ *          1行目：凡例を送信
+ *          毎フレーム：ax..yaw に加え固定線 Min/Max を一緒に送出（Yレンジを実質固定）
  */
 
 #include <M5Unified.h>
 #include <esp32-hal-cpu.h>
 #include "BluetoothSerial.h"
+#include <MadgwickAHRS.h>
+#include <math.h>
 
 BluetoothSerial SerialBT;
+Madgwick filter;
 
-// --- IMUデータ ---
-float accX=0, accY=0, accZ=0;  // [g]
+// --- IMUデータ（生） ---
+float accX=0, accY=0, accZ=0;     // [g]
+float gyroX=0, gyroY=0, gyroZ=0;  // [deg/s]
+
+// --- オフセット ---
+float gOffX=0.0f, gOffY=0.0f, gOffZ=0.0f;   // ジャイロ [deg/s]
+float aOffX=0.0f, aOffY=0.0f, aOffZ=0.0f;   // 加速度 [g]
+
+// --- 姿勢角（deg） ---
+float roll_deg=0.0f, pitch_deg=0.0f, yaw_deg=0.0f;
+
+// --- 移動平均（区間5） ---
+static const int MA_N = 5;
+float maRoll[MA_N] = {0}, maPitch[MA_N] = {0}, maYaw[MA_N] = {0};
+float sumRoll=0, sumPitch=0, sumYaw=0;
+int   maIdx=0, maCount=0;
 
 // --- 周期制御 ---
 static uint32_t next_ms = 0;          // 100msごと
 static uint32_t next_display_ms = 0;  // LCD更新タイマー（本番時 60sごと）
 
 // --- モード切替 ---
-bool debugMode = false;  // ← 本番: false / デバッグ: true
+bool debugMode = true;  // ← 本番: false / デバッグ: true
+
+// --- 精度優先キャリブ用サンプル数（必要なら変更） ---
+static const uint16_t CALIB_G_SAMPLES = 1500;
+static const uint16_t CALIB_A_SAMPLES = 1500;
+
+// --- シリアルプロッタ設定（Y軸レンジの“実質固定”） ---
+const bool   ENABLE_SERIAL_PLOTTER = true;   // 必要なければ false
+const float  PLOT_YMIN = -180.0f;            // 例：姿勢角の下限
+const float  PLOT_YMAX =  180.0f;            // 例：姿勢角の上限
+bool         plotterHeaderSent = false;      // 凡例行を一度だけ送るため
 
 // プロトタイプ
 void initM5();
 void initBluetooth();
-void renderUI(int batteryPct, float ax, float ay, float az, bool showAccel);
-void outputBT(float ax, float ay, float az);
+void calibrateGyroOffset(uint16_t samples);
+void calibrateAccelOffset(uint16_t samples);
+void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples);
+void resetAverages();
+void drawProgress(const char* title, uint16_t done, uint16_t total);
+void renderUI(int batteryPct, float ax, float ay, float az,
+              float roll_d, float pitch_d, float yaw_d, bool showDebug);
+void outputBT(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d);
+void outputSerialPlotter(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d);
+void maPush(float r, float p, float y, float &r_avg, float &p_avg, float &y_avg);
 
 void setup() {
   initM5();
   initBluetooth();
+
+  // USBシリアル: プロッタ用
+  Serial.begin(115200);
+  delay(50);
+
+  // Madgwick を 10Hz 前提で初期化（loopは100ms周期）
+  filter.begin(10);
+
+  // 起動時キャリブレーション（水平・静止を想定）
+  doOnDemandCalibration(CALIB_G_SAMPLES, CALIB_A_SAMPLES);
+
   next_ms = millis() + 100;
 
-  // 起動直後に一度表示（本番でもすぐに電池%が出る）
+  // 初回更新
   int batPct = M5.Power.getBatteryLevel();
   M5.Imu.getAccel(&accX, &accY, &accZ);
-  renderUI(batPct, accX, accY, accZ, debugMode);  // 本番時は電池のみ表示
+  M5.Imu.getGyro(&gyroX, &gyroY, &gyroZ);
+
+  float ax = accX - aOffX;
+  float ay = accY - aOffY;
+  float az = accZ - aOffZ;
+  float gx = gyroX - gOffX;
+  float gy = gyroY - gOffY;
+  float gz = gyroZ - gOffZ;
+
+  filter.updateIMU(gx, gy, gz, ax, ay, az);
+  roll_deg  = filter.getRoll();
+  pitch_deg = filter.getPitch();
+  yaw_deg   = filter.getYaw();
+
+  resetAverages();
+  float rAvg, pAvg, yAvg;
+  maPush(roll_deg, pitch_deg, yaw_deg, rAvg, pAvg, yAvg);
+
+  renderUI(batPct, ax, ay, az, rAvg, pAvg, yAvg, debugMode);
+
+  // シリアルプロッタ：凡例行
+  if (ENABLE_SERIAL_PLOTTER && !plotterHeaderSent) {
+    Serial.println("ax,ay,az,roll,pitch,yaw,Min,Max");
+    plotterHeaderSent = true;
+  }
+
   next_display_ms = millis() + (debugMode ? 100 : 60000);
 }
 
 void loop() {
   M5.update();
 
-  // 1) IMU
-  M5.Imu.getAccel(&accX, &accY, &accZ);
+  // BtnA（正面）で再キャリブレーション
+  if (M5.BtnA.wasPressed()) {
+    doOnDemandCalibration(CALIB_G_SAMPLES, CALIB_A_SAMPLES);
+    // 再キャリブ後もプロッタ凡例は維持する（再送しない）
+  }
 
-  // 2) バッテリー％（M5Unified提供）
+  // 1) IMU 読み出し
+  M5.Imu.getAccel(&accX, &accY, &accZ);     // [g]
+  M5.Imu.getGyro(&gyroX, &gyroY, &gyroZ);   // [deg/s]
+
+  // 2) オフセット補正
+  float ax = accX - aOffX;
+  float ay = accY - aOffY;
+  float az = accZ - aOffZ;
+  float gx = gyroX - gOffX;
+  float gy = gyroY - gOffY;
+  float gz = gyroZ - gOffZ;
+
+  // 3) Madgwick 更新（磁気なし=IMUモード）
+  filter.updateIMU(gx, gy, gz, ax, ay, az);
+
+  // 4) 姿勢角（生）→ 移動平均
+  float rRaw = filter.getRoll();
+  float pRaw = filter.getPitch();
+  float yRaw = filter.getYaw();   // 6軸のため長期ドリフトあり
+
+  float rAvg, pAvg, yAvg;
+  maPush(rRaw, pRaw, yRaw, rAvg, pAvg, yAvg);
+  roll_deg  = rAvg;
+  pitch_deg = pAvg;
+  yaw_deg   = yAvg;
+
+  // 5) バッテリー％
   int batPct = M5.Power.getBatteryLevel();
 
-  // 3) LCD更新：デバッグは100msごと、本番は60秒ごと
+  // 6) LCD更新
   uint32_t now = millis();
   if (now >= next_display_ms) {
-    renderUI(batPct, accX, accY, accZ, debugMode);  // 本番:電池のみ／デバッグ:電池+加速度
+    renderUI(batPct, ax, ay, az, roll_deg, pitch_deg, yaw_deg, debugMode);
     next_display_ms = now + (debugMode ? 100 : 60000);
   }
 
-  // 4) Bluetooth出力（常に100msごと）
-  outputBT(accX, accY, accZ);
+  // 7) Bluetooth出力（加速度 + 姿勢角（平滑後））
+  outputBT(ax, ay, az, roll_deg, pitch_deg, yaw_deg);
 
-  // 5) 周期100ms維持（ドリフトしにくい加算方式＋補正）
+  // 8) シリアルプロッタ出力（固定線Min/Max付き）
+  if (ENABLE_SERIAL_PLOTTER) {
+    outputSerialPlotter(ax, ay, az, roll_deg, pitch_deg, yaw_deg);
+  }
+
+  // 9) 周期100ms維持
   now = millis();
   if (now < next_ms) delay(next_ms - now);
   next_ms += 100;
@@ -77,33 +182,192 @@ void initM5() {
   M5.begin(cfg);
 
   setCpuFrequencyMhz(80);
-  M5.Display.setBrightness(64);//MAX: 255
+  M5.Display.setBrightness(64);// MAX: 255
   M5.Display.setRotation(3);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextSize(2);
+
+  M5.Imu.begin();  // 念のため明示初期化
 }
 
 void initBluetooth() {
   SerialBT.begin("orca-m5stick-c-plus-device");
-  delay(100);  // 初期化直後の安定待ち
+  delay(100);
 }
 
-// showAccel=true: 電池+加速度, false: 電池のみ
-void renderUI(int batteryPct, float ax, float ay, float az, bool showAccel) {
+// ---- 進捗バー描画 ----
+void drawProgress(const char* title, uint16_t done, uint16_t total) {
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.println(title);
+  float ratio = (total == 0) ? 0.f : (float)done / (float)total;
+  if (ratio < 0) ratio = 0;
+  if (ratio > 1) ratio = 1;
+  int barW = M5.Display.width() - 16;
+  int filled = (int)(barW * ratio);
+  int x = 8, y = 40, h = 16;
+  M5.Display.drawRect(x, y, barW, h, TFT_WHITE);
+  M5.Display.fillRect(x, y, filled, h, TFT_WHITE);
+  M5.Display.setCursor(0, 64);
+  M5.Display.printf("%u / %u (%.0f%%)\n", done, total, ratio*100.f);
+}
+
+// ---- キャリブレーション ----
+void calibrateGyroOffset(uint16_t samples) {
+  float sx=0, sy=0, sz=0;
+  for (uint16_t i=0; i<samples; ++i) {
+    float gx, gy, gz;
+    M5.Imu.getGyro(&gx, &gy, &gz);
+    sx += gx; sy += gy; sz += gz;
+    if ((i % 10) == 0) drawProgress("Calib Gyro: keep still", i, samples);
+    delay(2);
+  }
+  gOffX = sx / samples;
+  gOffY = sy / samples;
+  gOffZ = sz / samples;
+}
+
+void calibrateAccelOffset(uint16_t samples) {
+  // 水平・静止を想定: ax≈0g, ay≈0g, az≈+1g（表向き）
+  const float EX_AX = 0.0f;
+  const float EX_AY = 0.0f;
+  const float EX_AZ = 1.0f;
+
+  float sx=0, sy=0, sz=0;
+  for (uint16_t i=0; i<samples; ++i) {
+    float ax, ay, az;
+    M5.Imu.getAccel(&ax, &ay, &az);
+    sx += ax; sy += ay; sz += az;
+    if ((i % 10) == 0) drawProgress("Calib Accel: keep flat", i, samples);
+    delay(2);
+  }
+  float axm = sx / samples;
+  float aym = sy / samples;
+  float azm = sz / samples;
+
+  aOffX = axm - EX_AX;
+  aOffY = aym - EX_AY;
+  aOffZ = azm - EX_AZ;
+}
+
+// ---- On-demand キャリブレーション（BtnA押下時/起動時に呼ぶ）----
+void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples) {
+  // 案内
+  drawProgress("Prepare: lay flat & still", 0, 100);
+  delay(500);
+
+  calibrateGyroOffset(gSamples);
+  calibrateAccelOffset(aSamples);
+
+  // フィルタ/移動平均をリセット
+  filter.begin(10);
+  resetAverages();
+
+  // 初期一回更新で姿勢をセット
+  M5.Imu.getAccel(&accX, &accY, &accZ);
+  M5.Imu.getGyro(&gyroX, &gyroY, &gyroZ);
+
+  float ax = accX - aOffX;
+  float ay = accY - aOffY;
+  float az = accZ - aOffZ;
+  float gx = gyroX - gOffX;
+  float gy = gyroY - gOffY;
+  float gz = gyroZ - gOffZ;
+  filter.updateIMU(gx, gy, gz, ax, ay, az);
+
+  float r = filter.getRoll();
+  float p = filter.getPitch();
+  float y = filter.getYaw();
+  float rAvg, pAvg, yAvg;
+  maPush(r, p, y, rAvg, pAvg, yAvg);
+
+  // 完了表示
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.println("Calibration done");
+  M5.Display.printf("aOfs:%+.3f %+.3f %+.3f\n", aOffX, aOffY, aOffZ);
+  M5.Display.printf("gOfs:%+.3f %+.3f %+.3f\n", gOffX, gOffY, gOffZ);
+  delay(800);
+
+  SerialBT.printf("CALIB_DONE, aOff=(%.4f,%.4f,%.4f), gOff=(%.4f,%.4f,%.4f)\n",
+                  aOffX, aOffY, aOffZ, gOffX, gOffY, gOffZ);
+}
+
+// ---- 移動平均の初期化 ----
+void resetAverages() {
+  for (int i=0;i<MA_N;++i){ maRoll[i]=maPitch[i]=maYaw[i]=0.0f; }
+  sumRoll=sumPitch=sumYaw=0.0f;
+  maIdx=0;
+  maCount=0;
+}
+
+// ---- 表示 ----
+void renderUI(int batteryPct, float ax, float ay, float az,
+              float roll_d, float pitch_d, float yaw_d, bool showDebug) {
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setCursor(0, 0);
   M5.Display.printf("Bat:%3d%%\n", batteryPct);
-  if (showAccel) {
-    M5.Display.setCursor(0, 30);
+
+  if (showDebug) {
+    M5.Display.setCursor(0, 28);
     M5.Display.printf("aX:%6.2f aY:%6.2f aZ:%6.2f\n", ax, ay, az);
+    M5.Display.setCursor(0, 58);
+    M5.Display.printf("Roll :%7.2f\n", roll_d);
+    M5.Display.printf("Pitch:%7.2f\n", pitch_d);
+    M5.Display.printf("Yaw  :%7.2f\n", yaw_d);
+    M5.Display.setCursor(0, 120);
+    M5.Display.print("BtnA: Calibrate");
+  } else {
+    M5.Display.setCursor(0, 28);
+    M5.Display.print("BtnA: Calibrate");
   }
 }
 
-// デバッグ: プロッタ形式 / 本番: ラベル付き
-void outputBT(float ax, float ay, float az) {
+// ---- BT出力 ----
+void outputBT(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d) {
   if (debugMode) {
-    SerialBT.printf("%.3f %.3f %.3f\n", ax, ay, az);
+    SerialBT.printf("%.3f %.3f %.3f %.3f %.3f %.3f\n",
+                    ax, ay, az, roll_d, pitch_d, yaw_d);
   } else {
-    SerialBT.printf("ax:%.3f, ay:%.3f, az:%.3f\n", ax, ay, az);
+    SerialBT.printf("ax:%.3f, ay:%.3f, az:%.3f, roll:%.3f, pitch:%.3f, yaw:%.3f\n",
+                    ax, ay, az, roll_d, pitch_d, yaw_d);
   }
+}
+
+// ---- シリアルプロッタ（固定線 Min/Max を含めて出力）----
+void outputSerialPlotter(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d) {
+  // ラベル行はsetupで送信済み
+  Serial.print(ax, 3);     Serial.print(',');
+  Serial.print(ay, 3);     Serial.print(',');
+  Serial.print(az, 3);     Serial.print(',');
+  Serial.print(roll_d, 3); Serial.print(',');
+  Serial.print(pitch_d, 3);Serial.print(',');
+  Serial.print(yaw_d, 3);  Serial.print(',');
+  Serial.print(PLOT_YMIN, 3); Serial.print(',');
+  Serial.println(PLOT_YMAX, 3);
+}
+
+// ---- 区間5の移動平均 ----
+void maPush(float r, float p, float y, float &r_avg, float &p_avg, float &y_avg) {
+  int idx = maIdx % MA_N;
+
+  sumRoll  -= maRoll[idx];
+  sumPitch -= maPitch[idx];
+  sumYaw   -= maYaw[idx];
+
+  maRoll[idx]  = r;
+  maPitch[idx] = p;
+  maYaw[idx]   = y;
+
+  sumRoll  += maRoll[idx];
+  sumPitch += maPitch[idx];
+  sumYaw   += maYaw[idx];
+
+  maIdx++;
+  if (maCount < MA_N) maCount++;
+
+  float denom = (float)maCount;
+  r_avg = sumRoll  / denom;
+  p_avg = sumPitch / denom;
+  y_avg = sumYaw   / denom;
 }
