@@ -8,6 +8,7 @@
  * - 姿勢推定・区間5移動平均
  * - BT出力（ay/pitch/roll）
  * - USBシリアルプロッタ（ay/pitch/roll + Min/Max）
+ * ★ Bluetooth接続状態をディスプレイに表示する機能を追加
  */
 
 #include <M5Unified.h>
@@ -294,9 +295,11 @@ void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples) {
   M5.Display.printf("gOfs:%+.3f %+.3f %+.3f\n", gOffX, gOffY, gOffZ);
   delay(800);
 
-  SerialBT.printf("CALIB_DONE, aOff=(%.4f,%.4f,%.4f), gOff=(%.4f,%.4f,%.4f)\n",
-                  aOffX, aOffY, aOffZ, gOffX, gOffY, gOffZ);
-
+  if (SerialBT.hasClient()) { // ★変更点：接続中のみ送信
+    SerialBT.printf("CALIB_DONE, aOff=(%.4f,%.4f,%.4f), gOff=(%.4f,%.4f,%.4f)\n",
+                    aOffX, aOffY, aOffZ, gOffX, gOffY, gOffZ);
+  }
+  
   // ★ キャリブ済みフラグを立てる
   calibratedOnce = true;
 }
@@ -310,6 +313,9 @@ void resetAverages() {
 }
 
 // ---- 表示 ----
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★ 変更点：この関数にBluetooth接続状態の表示を追加 ★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 void renderUI(int batteryPct, float ax, float ay, float az,
               float roll_d, float pitch_d, float yaw_d, bool showDebug) {
   // 取得：USB VBUSの電圧/電流（M5Unified: AXP192）
@@ -318,8 +324,22 @@ void renderUI(int batteryPct, float ax, float ay, float az,
   bool usb_on = (vbus > VBUS_ON_THRESHOLD_V);
 
   M5.Display.fillScreen(TFT_BLACK);
+  
+  // 1行目にバッテリーとBT状態
   M5.Display.setCursor(0, 0);
-  M5.Display.printf("Bat:%3d%%\n", batteryPct);
+  M5.Display.printf("Bat:%3d%%", batteryPct); // 改行なしに変更
+
+  // BT状態を右側に表示
+  M5.Display.setCursor(130, 0); // 表示位置を調整
+  if (SerialBT.hasClient()) {
+    M5.Display.setTextColor(TFT_GREEN); // 接続中は緑
+    M5.Display.print("BT:OK");
+  } else {
+    M5.Display.setTextColor(TFT_WHITE); // 未接続は白
+    M5.Display.print("BT:Wait");
+  }
+  M5.Display.setTextColor(TFT_WHITE); // 文字色を白に戻す
+  M5.Display.println(); // ここで改行
 
   // 2行目にUSB状態
   M5.Display.setCursor(0, 18);
@@ -352,8 +372,13 @@ void renderUI(int batteryPct, float ax, float ay, float az,
 }
 
 // ---- BT出力（ay, pitch, roll ラベル付き）----
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+// ★ 変更点：クライアント接続中のみデータを送信するよう修正 ★
+// ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 void outputBT(float ax, float ay, float az, float roll_d, float pitch_d, float yaw_d) {
-  SerialBT.printf("ay:%.3f, pitch:%.3f, roll:%.3f\n", ay, pitch_d, roll_d);
+  if (SerialBT.hasClient()) {
+    SerialBT.printf("ay:%.3f, pitch:%.3f, roll:%.3f\n", ay, pitch_d, roll_d);
+  }
 }
 
 // ---- シリアルプロッタ（ay, pitch, roll のみ + 固定線）----
