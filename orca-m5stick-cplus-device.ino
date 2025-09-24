@@ -262,6 +262,19 @@ void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples) {
   drawProgress("Prepare: lay flat & still", 0, 100);
   delay(500);
 
+  // ★★★ ここから追加：5秒カウントダウン表示 ★★★
+  for (int s = 5; s > 0; --s) {
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setCursor(0, 0);
+    M5.Display.println("Calibration starts in");
+    M5.Display.setCursor(0, 24);
+    M5.Display.printf("%d\n", s);
+    M5.Display.setCursor(0, 48);
+    M5.Display.println("Keep flat & still");
+    delay(1000);
+  }
+  // ★★★ 追加ここまで ★★★
+
   calibrateGyroOffset(gSamples);
   calibrateAccelOffset(aSamples);
 
@@ -303,7 +316,6 @@ void doOnDemandCalibration(uint16_t gSamples, uint16_t aSamples) {
   // ★ キャリブ済みフラグを立てる
   calibratedOnce = true;
 }
-
 // ---- 移動平均の初期化 ----
 void resetAverages() {
   for (int i=0;i<MA_N;++i){ maRoll[i]=maPitch[i]=maYaw[i]=0.0f; }
